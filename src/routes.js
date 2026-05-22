@@ -1,12 +1,10 @@
-// NEVER do this (SQL injection risk):
-// pool.query(`SELECT * FROM todos WHERE id = ${id}`)
-
-// // ALWAYS do this:
-// pool.query('SELECT * FROM todos WHERE id = $1', [id])
-
 const express = require('express');
 const router = express.Router();
 const pool = require('./db');
+const redis = require('./cache');
+
+const CACHE_KEY = 'todos:all';
+const CACHE_TTL = 60; // seconds
 
 // POST /todos — create a new todo
 router.post('/', async (req, res) => {
@@ -21,6 +19,8 @@ router.post('/', async (req, res) => {
       'INSERT INTO todos (title, description) VALUES ($1, $2) RETURNING *',
       [title.trim(), description || null]
     );
+
+    await redis.del(CACHE_KEY); // invalidate cache
     res.status(201).json(result.rows[0]);
   } catch (err) {
     console.error(err);
@@ -28,12 +28,19 @@ router.post('/', async (req, res) => {
   }
 });
 
-// GET /todos — get all todos
+// GET /todos — get all todos (with Redis cache)
 router.get('/', async (req, res) => {
   try {
+    const cached = await redis.get(CACHE_KEY);
+    if (cached) {
+      console.log('Cache HIT');
+      return res.json(JSON.parse(cached));
+    }
+    console.log('Cache MISS — querying PostgreSQL');
     const result = await pool.query(
       'SELECT * FROM todos ORDER BY created_at DESC'
     );
+    await redis.setex(CACHE_KEY, CACHE_TTL, JSON.stringify(result.rows));
     res.json(result.rows);
   } catch (err) {
     console.error(err);
@@ -41,7 +48,7 @@ router.get('/', async (req, res) => {
   }
 });
 
-// GET /todos/:id — get one todo
+// GET /todos/:id — get one todo (no cache needed for single items here)
 router.get('/:id', async (req, res) => {
   const { id } = req.params;
 
@@ -67,7 +74,6 @@ router.patch('/:id', async (req, res) => {
   const { id } = req.params;
 
   try {
-    // First check if it exists
     const existing = await pool.query(
       'SELECT * FROM todos WHERE id = $1',
       [id]
@@ -77,12 +83,12 @@ router.patch('/:id', async (req, res) => {
       return res.status(404).json({ error: 'Todo not found' });
     }
 
-    // Flip the completed value
     const result = await pool.query(
       'UPDATE todos SET completed = NOT completed WHERE id = $1 RETURNING *',
       [id]
     );
 
+    await redis.del(CACHE_KEY); // invalidate cache
     res.json(result.rows[0]);
   } catch (err) {
     console.error(err);
@@ -104,6 +110,7 @@ router.delete('/:id', async (req, res) => {
       return res.status(404).json({ error: 'Todo not found' });
     }
 
+    await redis.del(CACHE_KEY); // invalidate cache
     res.json({ message: 'Todo deleted', todo: result.rows[0] });
   } catch (err) {
     console.error(err);
